@@ -1,0 +1,288 @@
+---
+title: "F1 Lap Tracking"
+output:
+  html_document:
+    df_print: paged
+    self_contained: true
+  pdf_document: default
+  output_file: "F1_Lap_Tracking.html"
+---
+
+Importing basic libraries
+```{r, warning=FALSE}
+#install.packages(c("readr", "tidyverse", "lubridate")))
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+```
+
+Extra libraries needed in later cells
+```{r, warning=FALSE}
+# Uncomment for first run, then can comment back again
+#install.packages(c("httr", "jsonlite", "ggimage", "gganimate", "gifski")) 
+
+# Used to pull json files and parse them into data frames
+library(httr) # For web requests on R
+library(jsonlite) # For reading JSON text
+library(lubridate) # For date/time manipulation
+
+# Visual tools
+library(ggimage) # Sub-library of ggplot
+library(gganimate) # Moving images
+library(gifski) # Showing moving images as a gif
+```
+
+
+Using Monaco 2025 as an example/placeholder because Lando Norris sets a record in his qualifying laps and it's a unique track
+```{r}
+year_of_research <- 2025    # User may control this
+country_name <- "Monaco"    # User may control this
+```
+
+Pulling and cleaning _MEETINGS_ Data
+```{r, message=FALSE}
+# User should not touch this
+meeting_URL1 <- paste0("https://api.openf1.org/v1/meetings?year=", year_of_research)
+meeting_URL <- paste0(meeting_URL1, "&country_name=", country_name)
+
+
+# Pulling "meetings" data from URL API on openf1.org
+meeting_json <- GET(meeting_URL)
+parsed_data <- content(meeting_json, "text") %>% fromJSON(flatten = TRUE)
+
+
+# Define a function to clean the data here
+clean_meeting_data <- function(json_df) {
+  json_df %>%
+    mutate(
+      across(c(meeting_key, circuit_key, country_key, year), as.integer),
+      date_start = ymd_hms(date_start),
+      date_start_EST = with_tz(date_start, "America/New_York")
+    )
+}
+
+# Send data through data cleaning
+meeting_info <- clean_meeting_data(parsed_data)
+
+
+# Inspect cleaned data ensuring all is valid
+str(meeting_info)
+meeting_info
+```
+
+Matching and grabbing now _SESSIONS_ Data
+```{r, message=FALSE}
+# Extract Key 
+mkey <- meeting_info$meeting_key[1]
+
+# Meeting key should be unique so only needing to filter on that
+sessions_url <- paste0("https://api.openf1.org/v1/sessions?meeting_key=", mkey)
+sessions_resp <- GET(sessions_url)
+sessions_raw <- content(sessions_resp, "text") %>% fromJSON(flatten = TRUE)
+
+# Clean session data function
+clean_sessions <- function(df) {
+  df %>%
+    mutate(
+      across(c(meeting_key, session_key, circuit_key, country_key, year), as.integer),
+      date_start = ymd_hms(date_start),
+      date_end   = ymd_hms(date_end),
+      date_start_EST = with_tz(date_start, "America/New_York"),
+      date_end_EST   = with_tz(date_end, "America/New_York")
+    )
+}
+
+# Send data through data cleaning
+sessions <- clean_sessions(sessions_raw)
+
+# Join Meetings to Sessions by meeting_key
+meeting_sessions <- sessions %>%
+  left_join(meeting_info, by = "meeting_key")
+
+meeting_sessions
+```
+
+
+# Now getting driver of interest
+```{r}
+driver_last_name <- "Norris"    # User may control this
+# Last name is Sentence Case
+```
+
+Pulling and cleaning _DRIVERS_ Data
+```{r, warning=FALSE, message=FALSE}
+driver_URL1 <- paste0("https://api.openf1.org/v1/drivers?meeting_key=", mkey)
+driver_URL <- paste0(driver_URL1, "&last_name=", driver_last_name)
+
+driver_resp <- GET(driver_URL)
+driver_raw <- content(driver_resp, "text") %>% fromJSON(flatten = TRUE)
+
+clean_drivers <- function(df) {
+  df %>%
+    mutate(
+      meeting_key = as.integer(meeting_key),
+      session_key = as.integer(session_key),
+      driver_number = as.integer(driver_number),
+      team_colour_hex = paste0("#", toupper(team_colour))
+    )
+}
+
+# Send data through data cleaning
+driver <- clean_drivers(driver_raw)
+
+# Quick inspection
+driver
+```
+
+
+
+# Now getting session of interest
+```{r}
+desired_session_name <- "Race"    # User may control this
+# Practice 1, Practice 2, Practice 3, Qualifying, Race (some sprint weekends may not include all practices)
+```
+
+Pulling and cleaning _LOCATION_ Data
+```{r, message=FALSE}
+# Get session row
+this_session <- meeting_sessions %>%
+  filter(session_name == desired_session_name) %>%
+  slice(1)
+
+session_key <- this_session$session_key
+
+# Get selected driver number (first result for now)
+driver_number <- driver$driver_number[1]
+
+# Format timestamps with milliseconds and no timezone suffix
+start_utc <- format(this_session$date_start.x, "%Y-%m-%dT%H:%M:%OS3")
+end_utc   <- format(this_session$date_end, "%Y-%m-%dT%H:%M:%OS3")
+
+# Build Location API URL correctly formatted
+location_url <- paste0(
+  "https://api.openf1.org/v1/location?",
+  "session_key=", session_key,
+  "&driver_number=", driver_number,
+  "&date%3E", start_utc,
+  "&date%3C", end_utc
+)
+
+loc_resp <- GET(location_url)
+loc_raw <- content(loc_resp, "text") %>% fromJSON(flatten = TRUE)
+
+clean_locations <- function(df) {
+  df %>%
+    mutate(
+      session_key   = as.integer(session_key),
+      driver_number = as.integer(driver_number),
+      x = as.numeric(x),
+      y = as.numeric(y),
+      z = as.numeric(z),
+      date_utc = ymd_hms(date),
+      #date_est = with_tz(date_utc, "America/New_York"),
+      date_est = as.POSIXct(date_utc, tz = "America/New_York")
+    )
+}
+
+locations <- clean_locations(loc_raw)
+
+head(locations)
+```
+
+
+# Visualizing
+Get a basic grasp of the map on an (x,y) plane
+```{r}
+# Create to see if everything worked together and looks alright
+p <- ggplot(locations, aes(x = x, y = y, color = driver$team_colour_hex[1])) +
+  geom_point(size = 0.5) +
+  scale_color_identity() +
+  coord_fixed() +
+  theme_minimal() +
+  labs(title = "2D \"Outline\" of Track")
+p
+```
+
+
+Let's try looking at it in 3d
+```{r, message=FALSE, warning=FALSE}
+library(plotly) # Library to get a third axis
+
+# Simple 3D scatter plot
+plot_ly(locations, 
+        x = ~x, 
+        y = ~y, 
+        z = ~z,
+        color = ~driver$broadcast_name[1],  # Color by driver
+        colors = unique(locations$team_colour_hex),  # Use team colors
+        type = 'scatter3d',
+        mode = 'markers',
+        marker = list(size = 2)) %>%
+  layout(
+    title = "3D Track View",
+    scene = list(
+      aspectmode = 'data',  # Keeps proportions accurate instead of stretching
+      xaxis = list(title = "X"),
+      yaxis = list(title = "Y"),
+      zaxis = list(title = "Z")
+    )
+  )
+```
+
+
+## Animate!
+```{r define_gif_filename, message=FALSE}
+# Always define the GIF filename so it's available for include_graphics()
+anim_file <- paste0(country_name, "_", year_of_research, ".gif")
+```
+
+
+```{r animate_lap, eval=interactive(), warning=FALSE, message=FALSE}
+# Base plot
+p <- ggplot(locations, aes(x = x, y = y, group = driver_number)) +
+  coord_equal() +
+  theme_void() +
+  labs(title = paste0(country_name, " ", year_of_research, ", ", desired_session_name)) +
+  theme(plot.title = element_text(size = 20))
+
+# Animate with shadow trail
+anim <- p +
+  geom_path(aes(color = driver$broadcast_name[1]), alpha = 0.3, linewidth = 0.4) +  # Map color to driver_name
+  geom_point(aes(color = driver$broadcast_name[1]), size = 3.5) +  # Map color to driver_name, remove show.legend = FALSE
+  scale_color_manual(
+    name = "Driver",  # Legend title
+    values = setNames(driver$team_colour_hex, driver$driver_name)  # Named vector of colors
+  ) +
+  transition_reveal(along = date_est) +
+  ease_aes('linear') +
+  geom_text(aes(x = min(x), y = max(y), label = paste0("Time: ", format(date_est, "%H:%M:%S"))),
+            hjust = 0, vjust = 1.5, size = 5, color = "darkgray") # Places the current time, will need tweaking depending on track
+
+# Save to a file for knitting
+anim_file <- paste0(country_name, "_", year_of_research, ".gif")
+
+# User may adjust, recommend starting with 300 then upping to around 3600 (can take around 5 mins to render there)
+nframes = 300
+
+# Render animation
+animation <- animate(anim, nframes = nframes, fps = 30, width = 800, height = 600, renderer = gifski_renderer())
+
+# Save GIF
+anim_save(filename = anim_file, animation = animation)
+```
+
+
+
+```{r show_animation, echo=FALSE, out.width='80%', fig.align='center'}
+knitr::include_graphics(anim_file)
+```
+
+
+Performance heavy animation. If it above worked, this will too, just be patient and maybe do something else for 5-10 mins.
+```{r animate_lap_big, eval=interactive()}
+#animate(anim, nframes = 5000, fps = 30, width = 800, height = 600, renderer = gifski_renderer())
+# This one loops the entire race for around 3 minutes
+```
+
+
